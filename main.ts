@@ -1,7 +1,10 @@
 
+
 import fetch from 'node-fetch';
 import mysql from 'mysql2/promise';
 import cron from 'node-cron';
+
+const WORKER_URL = process.env.WORKER_URL
 
 const DATABASE_URL = process.env.DATBASE_URL || process.env.DATABASE_URL;
 if (!DATABASE_URL) {
@@ -16,25 +19,25 @@ async function getApplications() {
 }
 
 async function fetchGuildCount(appId: string) {
-	const url = `https://discord-watch-worker.jxselinxe.workers.dev/api/v9/application-directory-static/applications/${appId}?locale=en-US`;
-		try {
-			const res = await fetch(url);
-			if (!res.ok) throw new Error(`HTTP ${res.status}`);
-			const data = (await res.json()) as {
-				directory_entry?: { guild_count?: number };
-				guild?: { approximate_member_count?: number };
-			};
-			if (data.directory_entry && typeof data.directory_entry.guild_count === 'number') {
-				return data.directory_entry.guild_count;
-			}
-			if (data.guild && typeof data.guild.approximate_member_count === 'number') {
-				return data.guild.approximate_member_count;
-			}
-			return null;
-		} catch (e) {
-			console.error(`Failed to fetch for app ${appId}:`, e);
-			return null;
+	const url = `${WORKER_URL}/${appId}?locale=en-US`;
+	try {
+		const res = await fetch(url);
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		const data = (await res.json()) as {
+			directory_entry?: { guild_count?: number };
+			guild?: { approximate_member_count?: number };
+		};
+		if (data.directory_entry && typeof data.directory_entry.guild_count === 'number') {
+			return data.directory_entry.guild_count;
 		}
+		if (data.guild && typeof data.guild.approximate_member_count === 'number') {
+			return data.guild.approximate_member_count;
+		}
+		return null;
+	} catch (e) {
+		console.error(`Failed to fetch for app ${appId}:`, e);
+		return null;
+	}
 }
 
 async function recordGuildCount(bot_id: string, guild_count: number) {
