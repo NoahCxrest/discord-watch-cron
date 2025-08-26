@@ -18,11 +18,8 @@ async function getApplications() {
 
 async function fetchGuildCount(appId: string) {
 	const url = `${WORKER_URL}/${appId}?locale=en-US`;
-	const maxRetries = 3;
-	let attempt = 0;
 	let delay = 1000;
-
-	while (attempt < maxRetries) {
+	while (true) {
 		try {
 			const controller = new AbortController();
 			const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
@@ -32,10 +29,9 @@ async function fetchGuildCount(appId: string) {
 			if (res.status === 429) {
 				const retryAfter = res.headers.get('Retry-After');
 				const waitTime = retryAfter ? parseInt(retryAfter, 10) * 1000 : delay;
-				console.warn(`Rate limited for app ${appId}, retrying in ${waitTime / 1000}s (attempt ${attempt + 1}/${maxRetries})`);
+				console.warn(`Rate limited for app ${appId}, retrying in ${waitTime / 1000}s`);
 				await new Promise(r => setTimeout(r, waitTime));
-				attempt++;
-				delay *= 2;
+				delay = Math.min(delay * 2, 60000); // exponential backoff, max 60s
 				continue;
 			}
 
@@ -54,16 +50,11 @@ async function fetchGuildCount(appId: string) {
 			}
 			return null;
 		} catch (e) {
-			if (attempt >= maxRetries - 1) {
-				console.error(`Failed to fetch for app ${appId} after ${maxRetries} attempts:`, e);
-				return null;
-			}
+			console.error(`Error fetching for app ${appId}:`, e);
 			await new Promise(r => setTimeout(r, delay));
-			delay *= 2;
-			attempt++;
+			delay = Math.min(delay * 2, 60000);
 		}
 	}
-	return null;
 }
 
 async function recordGuildCount(bot_id: string, guild_count: number) {
@@ -108,11 +99,40 @@ async function updateAllApplications() {
 		const batch = apps.slice(i, Math.min(i + concurrencyLimit, totalApps));
 		console.log(`\n[BATCH] Processing apps ${i + 1}-${Math.min(i + concurrencyLimit, totalApps)} of ${totalApps}`);
 
-		const batchPromises = batch.map((app, batchIndex) =>
-			processApp(app, i + batchIndex, totalApps)
-		);
+		// Retry logic: keep retrying failed apps in the batch until all succeed
+		let batchResults: PromiseSettledResult<any>[] = [];
+		let batchToProcess = batch;
+		let batchIndexes = batch.map((_, idx) => idx);
+		while (batchToProcess.length > 0) {
+			const batchPromises = batchToProcess.map((app, batchIndex) =>
+				processApp(app, i + batchIndexes[batchIndex], totalApps)
+			);
+			batchResults = await Promise.allSettled(batchPromises);
 
-		const batchResults = await Promise.allSettled(batchPromises);
+			// Find failed ones
+			const failedIndexes: number[] = [];
+			const failedApps: typeof batch = [];
+			const failedBatchIndexes: number[] = [];
+			batchResults.forEach((result, idx) => {
+				if (result.status !== 'fulfilled' || !result.value || !result.value.success) {
+					failedIndexes.push(idx);
+					failedApps.push(batchToProcess[idx]);
+					failedBatchIndexes.push(batchIndexes[idx]);
+				}
+			});
+
+			if (failedApps.length === 0) {
+				// All succeeded
+				break;
+			}
+
+			console.log(`[BATCH] Retrying ${failedApps.length} failed apps in this batch...`);
+			await new Promise(r => setTimeout(r, 2000));
+			batchToProcess = failedApps;
+			batchIndexes = failedBatchIndexes;
+		}
+
+		// All succeeded, push results
 		results.push(...batchResults);
 
 		if (i + concurrencyLimit < totalApps) {
