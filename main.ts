@@ -71,29 +71,30 @@ async function recordGuildCount(bot_id: string, guild_count: number) {
 
 async function updateAllApplications() {
 	const apps = await getApplications();
-	const concurrency = 10;
-	let i = 0;
-	async function next() {
-		if (i >= apps.length) return;
-		const app = apps[i++];
+	const totalApps = apps.length;
+	const totalDurationMs = 6 * 60 * 60 * 1000; // 6 hours in ms
+	const intervalMs = totalApps > 1 ? Math.floor(totalDurationMs / (totalApps - 1)) : 0;
+
+	for (let i = 0; i < totalApps; i++) {
+		const app = apps[i];
 		const guildCount = await fetchGuildCount(app.id);
 		if (guildCount !== null && app.bot_id) {
 			await recordGuildCount(app.bot_id, guildCount);
 			console.log(`Recorded guild_count=${guildCount} for bot_id=${app.bot_id}`);
 		}
-		await next();
+		if (i < totalApps - 1 && intervalMs > 0) {
+			await new Promise(r => setTimeout(r, intervalMs));
+		}
 	}
-	await Promise.all(Array(concurrency).fill(0).map(next));
 }
 
-cron.schedule('0 */6 * * *', async () => {
-    console.log('Starting 6-hourly update...');
-    try {
-        await updateAllApplications();
-        console.log('Update complete.');
-    } catch (e) {
-        console.error('Update failed:', e);
-    }
-});
 
-updateAllApplications().catch(console.error);
+cron.schedule('0 */6 * * *', async () => {
+	console.log('Starting 6-hourly update...');
+	try {
+		await updateAllApplications();
+		console.log('Update complete.');
+	} catch (e) {
+		console.error('Update failed:', e);
+	}
+});
