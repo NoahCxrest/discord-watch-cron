@@ -6,9 +6,9 @@ import cron from 'node-cron';
 
 const WORKER_URL = process.env.WORKER_URL
 
-const DATABASE_URL = process.env.DATBASE_URL || process.env.DATABASE_URL;
+const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
-	throw new Error('DATBASE_URL environment variable is not set');
+	throw new Error('DATABASE_URL environment variable is not set');
 }
 
 const pool = mysql.createPool(DATABASE_URL);
