@@ -64,7 +64,7 @@ async function fetchGuildCount(appId: string) {
 
 async function recordGuildCount(bot_id: string, guild_count: number) {
 		await pool.query(
-			'INSERT INTO app_stats (bot_id, guild_count) VALUES (?, ?)',
+			'INSERT INTO application_stats (bot_id, guild_count) VALUES (?, ?)',
 			[bot_id, guild_count]
 		);
 }
