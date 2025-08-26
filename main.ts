@@ -75,17 +75,32 @@ async function updateAllApplications() {
 	const totalDurationMs = 6 * 60 * 60 * 1000; // 6 hours in ms
 	const intervalMs = totalApps > 1 ? Math.floor(totalDurationMs / (totalApps - 1)) : 0;
 
+	console.log(`\n[INFO] Starting update for ${totalApps} apps.`);
+	console.log(`[INFO] Target total duration: ${(totalDurationMs / 1000 / 60 / 60).toFixed(2)} hours (${(totalDurationMs / 1000 / 60).toFixed(2)} minutes)`);
+	console.log(`[INFO] Calculated interval between each app: ${(intervalMs / 1000).toFixed(2)} seconds (${(intervalMs / 1000 / 60).toFixed(2)} minutes)\n`);
+
+	const startTime = Date.now();
 	for (let i = 0; i < totalApps; i++) {
 		const app = apps[i];
+		const appStart = Date.now();
+		console.log(`[${i+1}/${totalApps}] Fetching guild count for app id=${app.id}, bot_id=${app.bot_id}`);
 		const guildCount = await fetchGuildCount(app.id);
+		const appEnd = Date.now();
+		const elapsed = ((appEnd - appStart) / 1000).toFixed(2);
 		if (guildCount !== null && app.bot_id) {
 			await recordGuildCount(app.bot_id, guildCount);
-			console.log(`Recorded guild_count=${guildCount} for bot_id=${app.bot_id}`);
+			console.log(`[${i+1}/${totalApps}] Recorded guild_count=${guildCount} for bot_id=${app.bot_id} (fetch+record took ${elapsed}s)`);
+		} else {
+			console.log(`[${i+1}/${totalApps}] No guild count recorded for bot_id=${app.bot_id} (fetch took ${elapsed}s)`);
 		}
 		if (i < totalApps - 1 && intervalMs > 0) {
+			console.log(`[${i+1}/${totalApps}] Waiting ${(intervalMs / 1000).toFixed(2)} seconds before next app...`);
 			await new Promise(r => setTimeout(r, intervalMs));
 		}
 	}
+	const endTime = Date.now();
+	const totalElapsed = ((endTime - startTime) / 1000 / 60).toFixed(2);
+	console.log(`\n[INFO] Finished update for all apps. Actual elapsed time: ${totalElapsed} minutes.`);
 }
 
 
