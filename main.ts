@@ -1,60 +1,51 @@
-
-
-import mysql from 'mysql2/promise';
 import fetch from 'node-fetch';
+import mysql from 'mysql2/promise';
+import cron from 'node-cron';
 
-
-console.log('[DEBUG] Starting script...');
-const WORKER_URL = process.env.WORKER_URL;
-console.log('[DEBUG] WORKER_URL:', WORKER_URL);
+const WORKER_URL = process.env.WORKER_URL
 
 const DATABASE_URL = process.env.DATABASE_URL;
-console.log('[DEBUG] DATABASE_URL:', DATABASE_URL);
 if (!DATABASE_URL) {
 	throw new Error('DATABASE_URL environment variable is not set');
 }
 
 const pool = mysql.createPool(DATABASE_URL);
-console.log('[DEBUG] MySQL pool created.');
 
 async function getApplications() {
-	console.log('[DEBUG] Fetching applications from DB...');
-	try {
-		const [rows] = await pool.query('SELECT id, bot_id FROM applications');
-		console.log('[DEBUG] Applications fetched:', rows);
-		return rows as { id: string, bot_id: string }[];
-	} catch (e) {
-		console.error('[ERROR] Failed to fetch applications:', e);
-		throw e;
-	}
+	const [rows] = await pool.query('SELECT id, bot_id FROM applications');
+	return rows as { id: string, bot_id: string }[];
 }
 
 async function fetchGuildCount(appId: string) {
 	const url = `${WORKER_URL}/${appId}?locale=en-US`;
-	const maxRetries = 5;
+	const maxRetries = 3;
 	let attempt = 0;
-	let delay = 1000; // start with 1s
-	console.log(`[DEBUG] fetchGuildCount: appId=${appId}, url=${url}`);
+	let delay = 1000;
+
 	while (attempt < maxRetries) {
 		try {
-			const res = await fetch(url);
-			console.log(`[DEBUG] fetchGuildCount: HTTP status for appId=${appId}:`, res.status);
+			const controller = new AbortController();
+			const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+			const res = await fetch(url, { signal: controller.signal });
+			clearTimeout(timeoutId);
+
 			if (res.status === 429) {
-				// Rate limited, check Retry-After header
 				const retryAfter = res.headers.get('Retry-After');
 				const waitTime = retryAfter ? parseInt(retryAfter, 10) * 1000 : delay;
-				console.warn(`[WARN] Rate limited for app ${appId}, retrying in ${waitTime / 1000}s (attempt ${attempt + 1}/${maxRetries})`);
+				console.warn(`Rate limited for app ${appId}, retrying in ${waitTime / 1000}s (attempt ${attempt + 1}/${maxRetries})`);
 				await new Promise(r => setTimeout(r, waitTime));
 				attempt++;
-				delay *= 2; // exponential backoff
+				delay *= 2;
 				continue;
 			}
+
 			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
 			const data = (await res.json()) as {
 				directory_entry?: { guild_count?: number };
 				guild?: { approximate_member_count?: number };
 			};
-			console.log(`[DEBUG] fetchGuildCount: data for appId=${appId}:`, data);
+
 			if (data.directory_entry && typeof data.directory_entry.guild_count === 'number') {
 				return data.directory_entry.guild_count;
 			}
@@ -63,12 +54,10 @@ async function fetchGuildCount(appId: string) {
 			}
 			return null;
 		} catch (e) {
-			console.error(`[ERROR] fetchGuildCount: error for appId=${appId} (attempt ${attempt + 1}):`, e);
 			if (attempt >= maxRetries - 1) {
-				console.error(`[ERROR] Failed to fetch for app ${appId} after ${maxRetries} attempts:`, e);
+				console.error(`Failed to fetch for app ${appId} after ${maxRetries} attempts:`, e);
 				return null;
 			}
-			// Wait before retrying on error
 			await new Promise(r => setTimeout(r, delay));
 			delay *= 2;
 			attempt++;
@@ -78,74 +67,92 @@ async function fetchGuildCount(appId: string) {
 }
 
 async function recordGuildCount(bot_id: string, guild_count: number) {
-	console.log(`[DEBUG] recordGuildCount: bot_id=${bot_id}, guild_count=${guild_count}`);
-	try {
-		const [result] = await pool.query(
-			'INSERT INTO application_stats (bot_id, guild_count) VALUES (?, ?)',
-			[bot_id, guild_count]
-		);
-		console.log('[DEBUG] recordGuildCount: insert result:', result);
-	} catch (e) {
-		console.error(`[ERROR] recordGuildCount: failed to insert for bot_id=${bot_id}:`, e);
+	await pool.query(
+		'INSERT INTO application_stats (bot_id, guild_count) VALUES (?, ?)',
+		[bot_id, guild_count]
+	);
+}
+
+async function processApp(app: { id: string, bot_id: string }, index: number, total: number) {
+	const appStart = Date.now();
+	console.log(`[${index + 1}/${total}] Fetching guild count for app id=${app.id}, bot_id=${app.bot_id}`);
+	
+	const guildCount = await fetchGuildCount(app.id);
+	const appEnd = Date.now();
+	const elapsed = ((appEnd - appStart) / 1000).toFixed(2);
+	
+	if (guildCount !== null && app.bot_id) {
+		await recordGuildCount(app.bot_id, guildCount);
+		console.log(`[${index + 1}/${total}] ✓ Recorded guild_count=${guildCount} for bot_id=${app.bot_id} (took ${elapsed}s)`);
+		return { success: true, app, guildCount, elapsed };
+	} else {
+		console.log(`[${index + 1}/${total}] ✗ No guild count recorded for bot_id=${app.bot_id} (took ${elapsed}s)`);
+		return { success: false, app, elapsed };
 	}
 }
 
 async function updateAllApplications() {
-	console.log('[DEBUG] updateAllApplications: starting...');
-	let apps;
-	try {
-		apps = await getApplications();
-	} catch (e) {
-		console.error('[ERROR] updateAllApplications: failed to get applications:', e);
-		return;
-	}
+	const apps = await getApplications();
 	const totalApps = apps.length;
-	const totalDurationMs = 6 * 60 * 60 * 1000; // 6 hours in ms
-	const intervalMs = totalApps > 1 ? Math.floor(totalDurationMs / (totalApps - 1)) : 0;
-
-	console.log(`\n[INFO] Starting update for ${totalApps} apps.`);
-	console.log(`[INFO] Target total duration: ${(totalDurationMs / 1000 / 60 / 60).toFixed(2)} hours (${(totalDurationMs / 1000 / 60).toFixed(2)} minutes)`);
-	console.log(`[INFO] Calculated interval between each app: ${(intervalMs / 1000).toFixed(2)} seconds (${(intervalMs / 1000 / 60).toFixed(2)} minutes)\n`);
-
+	
+	console.log(`\n[INFO] Starting concurrent update for ${totalApps} apps.`);
 	const startTime = Date.now();
-	for (let i = 0; i < totalApps; i++) {
-		const app = apps[i];
-		const appStart = Date.now();
-		console.log(`[${i+1}/${totalApps}] Fetching guild count for app id=${app.id}, bot_id=${app.bot_id}`);
-		let guildCount;
-		try {
-			guildCount = await fetchGuildCount(app.id);
-		} catch (e) {
-			console.error(`[ERROR] updateAllApplications: fetchGuildCount failed for app id=${app.id}:`, e);
-			guildCount = null;
-		}
-		const appEnd = Date.now();
-		const elapsed = ((appEnd - appStart) / 1000).toFixed(2);
-		if (guildCount !== null && app.bot_id) {
-			await recordGuildCount(app.bot_id, guildCount);
-			console.log(`[${i+1}/${totalApps}] Recorded guild_count=${guildCount} for bot_id=${app.bot_id} (fetch+record took ${elapsed}s)`);
-		} else {
-			console.log(`[${i+1}/${totalApps}] No guild count recorded for bot_id=${app.bot_id} (fetch took ${elapsed}s)`);
-		}
-		if (i < totalApps - 1 && intervalMs > 0) {
-			console.log(`[${i+1}/${totalApps}] Waiting ${(intervalMs / 1000).toFixed(2)} seconds before next app...`);
-			await new Promise(r => setTimeout(r, intervalMs));
+	
+	const concurrencyLimit = 10;
+	const results: PromiseSettledResult<
+		{ success: boolean; app: { id: string; bot_id: string }; guildCount: number; elapsed: string } |
+		{ success: boolean; app: { id: string; bot_id: string }; elapsed: string; guildCount?: undefined }
+	>[] = [];
+
+	for (let i = 0; i < totalApps; i += concurrencyLimit) {
+		const batch = apps.slice(i, Math.min(i + concurrencyLimit, totalApps));
+		console.log(`\n[BATCH] Processing apps ${i + 1}-${Math.min(i + concurrencyLimit, totalApps)} of ${totalApps}`);
+
+		const batchPromises = batch.map((app, batchIndex) =>
+			processApp(app, i + batchIndex, totalApps)
+		);
+
+		const batchResults = await Promise.allSettled(batchPromises);
+		results.push(...batchResults);
+
+		if (i + concurrencyLimit < totalApps) {
+			console.log(`[BATCH] Waiting 2 seconds before next batch...`);
+			await new Promise(r => setTimeout(r, 2000));
 		}
 	}
+
 	const endTime = Date.now();
 	const totalElapsed = ((endTime - startTime) / 1000 / 60).toFixed(2);
-	console.log(`\n[INFO] Finished update for all apps. Actual elapsed time: ${totalElapsed} minutes.`);
+
+	let successful = 0;
+	let failed = 0;
+	for (const r of results) {
+		if (r.status === 'fulfilled' && r.value && (r.value as any).success) {
+			successful++;
+		} else {
+			failed++;
+		}
+	}
+
+	console.log(`\n[INFO] ✓ Completed concurrent update for all apps in ${totalElapsed} minutes.`);
+	console.log(`[INFO] Results: ${successful} successful, ${failed} failed out of ${totalApps} total apps.`);
+	console.log(`[INFO] Average time per app: ${((endTime - startTime) / totalApps / 1000).toFixed(2)} seconds`);
+	console.log(`[INFO] Speed improvement: ~${((6 * 60) / parseFloat(totalElapsed)).toFixed(1)}x faster than sequential processing\n`);
 }
 
+cron.schedule('0 */6 * * *', async () => {
+	console.log(`[${new Date().toISOString()}] Starting 6-hourly concurrent update...`);
+	try {
+		await updateAllApplications();
+		console.log(`[${new Date().toISOString()}] Update complete. Next update in 6 hours.`);
+	} catch (e) {
+		console.error(`[${new Date().toISOString()}] Update failed:`, e);
+	}
+});
 
-// Run as a normal task
-console.log('[DEBUG] Invoking updateAllApplications...');
-updateAllApplications()
-	.then(() => {
-		console.log('[DEBUG] updateAllApplications finished.');
-		process.exit(0);
-	})
-	.catch((e) => {
-		console.error('[ERROR] updateAllApplications failed:', e);
-		process.exit(1);
-	});
+console.log('Application scanner started. Running initial scan...');
+updateAllApplications().then(() => {
+	console.log('Initial scan complete. Scheduled updates will run every 6 hours.');
+}).catch(e => {
+	console.error('Initial scan failed:', e);
+});
