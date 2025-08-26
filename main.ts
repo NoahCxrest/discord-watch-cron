@@ -20,24 +20,46 @@ async function getApplications() {
 
 async function fetchGuildCount(appId: string) {
 	const url = `${WORKER_URL}/${appId}?locale=en-US`;
-	try {
-		const res = await fetch(url);
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		const data = (await res.json()) as {
-			directory_entry?: { guild_count?: number };
-			guild?: { approximate_member_count?: number };
-		};
-		if (data.directory_entry && typeof data.directory_entry.guild_count === 'number') {
-			return data.directory_entry.guild_count;
+	const maxRetries = 5;
+	let attempt = 0;
+	let delay = 1000; // start with 1s
+	while (attempt < maxRetries) {
+		try {
+			const res = await fetch(url);
+			if (res.status === 429) {
+				// Rate limited, check Retry-After header
+				const retryAfter = res.headers.get('Retry-After');
+				const waitTime = retryAfter ? parseInt(retryAfter, 10) * 1000 : delay;
+				console.warn(`Rate limited for app ${appId}, retrying in ${waitTime / 1000}s (attempt ${attempt + 1}/${maxRetries})`);
+				await new Promise(r => setTimeout(r, waitTime));
+				attempt++;
+				delay *= 2; // exponential backoff
+				continue;
+			}
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const data = (await res.json()) as {
+				directory_entry?: { guild_count?: number };
+				guild?: { approximate_member_count?: number };
+			};
+			if (data.directory_entry && typeof data.directory_entry.guild_count === 'number') {
+				return data.directory_entry.guild_count;
+			}
+			if (data.guild && typeof data.guild.approximate_member_count === 'number') {
+				return data.guild.approximate_member_count;
+			}
+			return null;
+		} catch (e) {
+			if (attempt >= maxRetries - 1) {
+				console.error(`Failed to fetch for app ${appId} after ${maxRetries} attempts:`, e);
+				return null;
+			}
+			// Wait before retrying on error
+			await new Promise(r => setTimeout(r, delay));
+			delay *= 2;
+			attempt++;
 		}
-		if (data.guild && typeof data.guild.approximate_member_count === 'number') {
-			return data.guild.approximate_member_count;
-		}
-		return null;
-	} catch (e) {
-		console.error(`Failed to fetch for app ${appId}:`, e);
-		return null;
 	}
+	return null;
 }
 
 async function recordGuildCount(bot_id: string, guild_count: number) {
